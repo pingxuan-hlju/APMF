@@ -7,10 +7,9 @@ The project  is an implementation of a multi-granularity transformer contrastive
 
 ## Catalogs  
 - **/Model**: Contains the code implementation of APMF algorithm.
-- **APMF.py**: Contains the code implementation of APMF algorithm and training process.
 - **dataloader.py**: Processes the miRNA,disease, and lncRNA similarities, associations, embeddings, and adjacency matrices.
 - **model.py**: Defines the model.
-
+- **main.py**: Trains the model.
 ---
 
 ## Environment 
