@@ -160,3 +160,124 @@ def contrastive_loss(p_n_output,p_r_output,n_n_output,n_r_output,nce_temp,calpha
         relation_loss=(p_r_output*n_r_output).sum(-1)/(torch.sqrt((p_r_output**2).sum(-1))*torch.sqrt((n_r_output**2).sum(-1)))
         relation_loss=(relation_loss+1)/2
         return node_loss+calpha*relation_loss.mean()
+
+class CNet(nn.Module):
+    def __init__(self,input_dim,hidden_dim,heads,walk_len):
+        super(CNet,self).__init__()
+        self.ml1,self.dl1=nn.Linear(input_dim,hidden_dim),nn.Linear(input_dim,hidden_dim)
+        self.mn1,self.dn1=nn.LayerNorm(hidden_dim),nn.LayerNorm(hidden_dim)
+        self.LMHA=nn.MultiheadAttention(hidden_dim,heads,batch_first=True)
+        self.Ln=nn.LayerNorm(hidden_dim)
+        self.ml2,self.dl2=nn.Linear(walk_len,1),nn.Linear(walk_len,1)
+        self.mn2,self.dn2=nn.LayerNorm(hidden_dim),nn.LayerNorm(hidden_dim)
+        self.GMHA=nn.MultiheadAttention(hidden_dim,heads,batch_first=True)
+        self.Gn=nn.LayerNorm(hidden_dim)
+        self.reset_parameters()
+    def forward(self,xm,xd):
+        xm,xd=self.mn1(self.ml1(xm)),self.dn1(self.dl1(xd))
+        xmd=torch.cat([xm,xd],dim=1)
+        nx=self.Ln(self.LMHA(xmd,xmd,xmd)[0])
+        xm=self.mn2(self.ml2(xm.transpose(1,2)).transpose(1,2))
+        xd=self.dn2(self.dl2(xd.transpose(1,2)).transpose(1,2))
+        xmd=torch.cat([xm,xd],dim=1)
+        rx=self.Gn(self.GMHA(xmd,xmd,xmd)[0])
+        return nx,rx
+
+class PNet(nn.Module):
+    def __init__(self,input_dim,hidden_dim,hidden_channle,num_group,gate_treshold=0.5,dropout_rate=0):
+        super(PNet,self).__init__()
+        self.proj1=nn.Linear(input_dim,hidden_dim)
+        self.proj2=nn.Linear(hidden_dim,hidden_dim)
+        self.norm=nn.LayerNorm(hidden_dim)
+        self.conv1=nn.Conv2d(1,hidden_channle,kernel_size=(1,1),stride=1,padding=0)
+        self.gn=nn.GroupNorm(num_groups=num_group,num_channels=hidden_channle)
+        self.gate_treshold=gate_treshold
+        self.gc=nn.Conv2d(hidden_channle,num_group,kernel_size=(2,7),stride=(2,7),padding=0,groups=num_group)
+        self.pool=nn.AdaptiveAvgPool2d((16,512))
+        self.l1=nn.Linear(num_group*1024,512)
+        self.dropout=nn.Dropout(dropout_rate)
+        self.l2=nn.Linear(512,2)
+        self.sigmoid=nn.Sigmoid()
+        self.leakyrelu=nn.LeakyReLU()
+        self.reset_parameters()
+    def forward(self,x1,x2):
+        x=torch.cat([self.proj1(x1),self.proj2(x2)],dim=0)
+        x=self.norm(x)
+        x=self.leakyrelu(self.conv1(x[:,None,:,:]))
+        gn_x=self.gn(x)
+        w_gamma=self.gn.weight/sum(self.gn.weight)
+        reweight=self.sigmoid(gn_x*w_gamma[None,:,None,None])
+        x1=torch.where(reweight>self.gate_treshold,torch.ones_like(reweight),reweight)*x
+        x2=torch.where(reweight<self.gate_treshold,torch.zeros_like(reweight),reweight)*x
+        x11,x12=torch.split(x1,x1.size(1)//2,dim=1)
+        x21,x22=torch.split(x2,x2.size(1)//2,dim=1)
+        x=torch.cat([x11+x22,x12+x21],dim=1)
+        x=self.pool(self.leakyrelu(self.gc(x)))
+        return self.l2(self.dropout(self.l1(x.reshape(x.shape[0],-1))))
+
+test_metric = []
+DP=DataProcess(kfolds, rw_param, adj_threshold, common_set, train_set, test_set)
+testLoader = DP.tr_va_te_data_set(test_set['edge'], test_set['label'], batch, -1)
+for i in range(kfolds):
+    ES=EarlyStopping("./models/ZC_Cmodel_fold_%d.pkl"%i,patience=3)
+    Cmodel=CNet(input_dim,C_model_param['hidden_size'],C_model_param['n_heads'],rw_param['rw_len']+1).to(device)
+    optimizer = torch.optim.Adam(Cmodel.parameters(), lr=C_model_param['lr'], weight_decay=C_model_param['weight_decay'])
+    trainLoader = DP.tr_va_te_data_set(train_set['edge_train_%d'%i], train_set['label_train_%d'%i], batch, i)
+    validLoader = DP.tr_va_te_data_set(train_set['edge_valid_%d'%i], train_set['label_valid_%d'%i], batch, i)
+    for e in range(C_model_param['epochs']):
+        Cmodel.train()
+        loss_total=0
+        for _, _, p_rw_m, p_rw_d, n_rw_m, n_rw_d in trainLoader:
+            p_n_output,p_r_output=Cmodel(p_rw_m.float().to(device),p_rw_d.float().to(device))
+            n_n_output,n_r_output=Cmodel(n_rw_m.float().to(device),n_rw_d.float().to(device))
+            loss=contrastive_loss(p_n_output,p_r_output,n_n_output,n_r_output,nce_temp,calpha)
+            loss_total+=loss.item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        print('fold:'+str(i+1)+';epoch'+str(e+1)+':'+str(loss_total))
+        ES(loss_total,Cmodel)
+        if ES.earlystop :
+            print('contrastive learning stop')
+            break
+    ES=EarlyStopping("./models/ZC_Pmodel_fold_%d.pkl"%i,patience=3)
+    Pmodel=PNet(input_dim,C_model_param['hidden_size'],P_model_param['hidden_channle'],P_model_param['num_group'],
+                P_model_param['gate_treshold'],P_model_param['dropout_rate']).to(device)
+    Cmodel.load_state_dict(torch.load("./models/ZC_Cmodel_fold_%d.pkl"%i))
+    optimizer = torch.optim.Adam(Pmodel.parameters(), lr=P_model_param['lr'], weight_decay=P_model_param['weight_decay'])
+    cost=nn.CrossEntropyLoss()
+    for e in range(P_model_param['epochs']):
+        Pmodel.train()
+        for data, label, p_rw_m, p_rw_d, _, _ in trainLoader:
+            n_x,r_x=Cmodel(p_rw_m.float().to(device),p_rw_d.float().to(device))
+            output=Pmodel(torch.cat([p_rw_m[:,0:1,:].float().to(device),p_rw_d[:,0:1,:].float().to(device)],dim=1),
+                          torch.cat([n_x.detach(),r_x.detach()],dim=1))
+            loss=cost(output,label.long().to(device))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        Pmodel.eval()
+        with torch.no_grad():
+            loss_total=0
+            for data, label, p_rw_m, p_rw_d, _, _ in validLoader:
+                n_x,r_x=Cmodel(p_rw_m.float().to(device),p_rw_d.float().to(device))
+                output=Pmodel(torch.cat([p_rw_m[:,0:1,:].float().to(device),p_rw_d[:,0:1,:].float().to(device)],dim=1),
+                              torch.cat([n_x.detach(),r_x.detach()],dim=1))
+                loss=cost(output,label.long().to(device))
+            loss_total+=loss.item()
+        print('fold:'+str(i+1)+';epoch'+str(e+1)+':'+str(loss_total))
+        ES(loss_total,Pmodel)
+        if ES.earlystop :
+            print('stop')
+            break
+    l_m,p_m=[],[]
+    Pmodel.load_state_dict(torch.load("./models/ZC_Pmodel_fold_%d.pkl"%i))
+    Pmodel.eval()
+    with torch.no_grad():
+        for data, label, p_rw_m, p_rw_d, _, _ in testLoader:
+            n_x,r_x=Cmodel(p_rw_m.float().to(device),p_rw_d.float().to(device))
+            output=Pmodel(torch.cat([p_rw_m[:,0:1,:].float().to(device),p_rw_d[:,0:1,:].float().to(device)],dim=1),
+                          torch.cat([n_x.detach(),r_x.detach()],dim=1))
+            l_m.append(label.float())
+            p_m.append(output.cpu().detach())
+    test_metric.append(caculate_metrics(torch.cat(p_m,dim=0),torch.cat(l_m,dim=0),'softmax'))
